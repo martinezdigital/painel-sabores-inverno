@@ -88,6 +88,53 @@ let cityMap;
 let cityLayer;
 let dashboardData;
 let refreshTimer;
+let timelinePeriod = "all";
+let selectedRestaurantName = "";
+
+const MAIN_PERIOD = "all";
+
+const cityCoordinateFallback = {
+  curitiba: [-25.4284, -49.2733],
+  "sao paulo": [-23.5505, -46.6333],
+  "são paulo": [-23.5505, -46.6333],
+  "sao jose dos pinhais": [-25.5313, -49.2031],
+  "são josé dos pinhais": [-25.5313, -49.2031],
+  colombo: [-25.2925, -49.2242],
+  "porto alegre": [-30.0346, -51.2177],
+  "rio de janeiro": [-22.9068, -43.1729],
+  guarapuava: [-25.3902, -51.4623],
+  guarulhos: [-23.4545, -46.5333],
+  itabira: [-19.6239, -43.2312],
+  itabuna: [-14.7856, -39.2804],
+  lages: [-27.8150, -50.3264],
+  paranagua: [-25.5205, -48.5095],
+  "paranaguá": [-25.5205, -48.5095],
+  "ponta grossa": [-25.0994, -50.1583],
+  "rio negro": [-26.1059, -49.7973],
+  "vila velha": [-20.3478, -40.2949]
+};
+
+const cityDisplayFallback = {
+  "sao paulo": "São Paulo",
+  "sao jose dos pinhais": "São José dos Pinhais",
+  paranagua: "Paranaguá"
+};
+
+function cityKey(city) {
+  return String(city || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function displayCity(city) {
+  return cityDisplayFallback[cityKey(city)] || city;
+}
+
+function cityCoordinates(city) {
+  return cityCoordinateFallback[cityKey(city)] || null;
+}
 
 function supabaseConfig() {
   const config = window.SABORES_SUPABASE || {};
@@ -95,6 +142,48 @@ function supabaseConfig() {
   const anonKey = String(config.anonKey || "");
   if (!url || !anonKey) return null;
   return { url, anonKey };
+}
+
+function googleAnalyticsConfig() {
+  const config = window.SABORES_GA_PROXY || {};
+  const url = String(config.url || "");
+  if (!url) return null;
+  return { url };
+}
+
+function loadJsonp(url, params = {}) {
+  return new Promise((resolve, reject) => {
+    const callbackName = `saboresGaCallback_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const script = document.createElement("script");
+    const finalUrl = new URL(url);
+
+    Object.entries(params).forEach(([key, value]) => finalUrl.searchParams.set(key, value));
+    finalUrl.searchParams.set("callback", callbackName);
+
+    const cleanup = () => {
+      delete window[callbackName];
+      script.remove();
+    };
+
+    window[callbackName] = (data) => {
+      cleanup();
+      resolve(data);
+    };
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error("Não foi possível carregar os dados do Google Analytics"));
+    };
+
+    script.src = finalUrl.toString();
+    document.head.appendChild(script);
+  });
+}
+
+async function loadGoogleAnalyticsData(period = "7d") {
+  const config = googleAnalyticsConfig();
+  if (!config) return null;
+  return await loadJsonp(config.url, { period_key: period, cache: String(Date.now()) });
 }
 
 async function loadLiveData(period = "7d") {
@@ -117,6 +206,13 @@ async function loadLiveData(period = "7d") {
 }
 
 async function loadData(period = "7d") {
+  try {
+    const gaData = await loadGoogleAnalyticsData(period);
+    if (gaData) return gaData;
+  } catch (error) {
+    console.warn("Google Analytics indisponível:", error);
+  }
+
   try {
     const liveData = await loadLiveData(period);
     if (liveData) return liveData;
@@ -149,6 +245,10 @@ function renderKpis(data) {
   setText("kpi-votes", number(data.totals.voteClicks));
   setText("centro-views", number(data.centroEuropeu.sectionViews));
   setText("centro-clicks", number(data.centroEuropeu.clicks));
+  setText(
+    "centro-copy",
+    `${number(data.centroEuropeu.sectionViews)} pessoas já viram a presença institucional do Centro Europeu no site do festival. Essa exposição reforça a chancela de capacitação, excelência e desenvolvimento da gastronomia local.`
+  );
 }
 
 function renderRealtime(data) {
@@ -198,6 +298,12 @@ function renderTimeline(data) {
   }).join("");
 }
 
+function setTimelineButtons(period) {
+  document.querySelectorAll("#timeline-controls [data-period]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.period === period);
+  });
+}
+
 function renderCities(data) {
   const cities = [...(data.cities || [])].sort((a, b) => b.users - a.users);
   const max = Math.max(...cities.map((city) => city.users), 1);
@@ -205,7 +311,7 @@ function renderCities(data) {
 
   document.getElementById("city-list").innerHTML = cities.slice(0, 6).map((city) => `
     <li>
-      <strong>${city.city}</strong>
+      <strong>${displayCity(city.city)}</strong>
       <span>${number(city.users)} ${city.users === 1 ? "usuário" : "usuários"}</span>
     </li>
   `).join("");
@@ -240,7 +346,10 @@ function renderCities(data) {
 
   const bounds = [];
   cities.forEach((city) => {
-    if (typeof city.lat !== "number" || typeof city.lng !== "number") return;
+    const fallback = cityCoordinates(city.city);
+    const lat = typeof city.lat === "number" ? city.lat : fallback?.[0];
+    const lng = typeof city.lng === "number" ? city.lng : fallback?.[1];
+    if (typeof lat !== "number" || typeof lng !== "number") return;
     const size = 26 + (city.users / max) * 32;
     const icon = L.divIcon({
       className: "",
@@ -249,11 +358,11 @@ function renderCities(data) {
       iconAnchor: [size / 2, size / 2]
     });
 
-    L.marker([city.lat, city.lng], { icon })
-      .bindPopup(`<strong>${city.city}</strong><br>${number(city.users)} ${city.users === 1 ? "usuário" : "usuários"}`)
+    L.marker([lat, lng], { icon })
+      .bindPopup(`<strong>${displayCity(city.city)}</strong><br>${number(city.users)} ${city.users === 1 ? "usuário" : "usuários"}`)
       .addTo(cityLayer);
 
-    bounds.push([city.lat, city.lng]);
+    bounds.push([lat, lng]);
   });
 
   if (bounds.length > 1) {
@@ -267,19 +376,95 @@ function restaurantScore(item) {
   return (item.views || 0) + (item.instagram || 0) * 2 + (item.maps || 0) * 1.5;
 }
 
-function renderRestaurants(data, focus = "views") {
-  const table = document.getElementById("restaurant-table");
-  const restaurants = [...(data.restaurants || [])].sort((a, b) => {
-    const metricA = focus === "instagram" ? a.instagram : focus === "maps" ? a.maps : a.views;
-    const metricB = focus === "instagram" ? b.instagram : focus === "maps" ? b.maps : b.views;
-    return metricB - metricA || restaurantScore(b) - restaurantScore(a);
+function restaurantLabel(item) {
+  return `${item.name} — ${item.dish || "Menu participante"}`;
+}
+
+function restaurantsAlphabetical(data) {
+  return [...(data.restaurants || [])].sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+}
+
+function topRestaurants(data) {
+  return [...(data.restaurants || [])].sort((a, b) => restaurantScore(b) - restaurantScore(a));
+}
+
+function renderRestaurantSpotlight(item) {
+  const card = document.getElementById("restaurant-spotlight");
+
+  if (!item) {
+    card.innerHTML = `<span class="empty-state">Selecione um restaurante para destacar os dados.</span>`;
+    return;
+  }
+
+  const maxScore = Math.max(...(dashboardData?.restaurants || []).map(restaurantScore), 1);
+  const score = Math.round((restaurantScore(item) / maxScore) * 100);
+
+  card.innerHTML = `
+    <h3>${item.name}</h3>
+    <p class="dish">${item.dish || "Menu participante"}</p>
+    <div class="spotlight-kpis">
+      <div>
+        <span>Menu aberto</span>
+        <strong>${number(item.views)}</strong>
+      </div>
+      <div>
+        <span>Instagram</span>
+        <strong>${number(item.instagram)}</strong>
+      </div>
+      <div>
+        <span>Rotas</span>
+        <strong>${number(item.maps)}</strong>
+      </div>
+      <div>
+        <span>Índice</span>
+        <strong>${number(score)}</strong>
+      </div>
+    </div>`;
+}
+
+function selectRestaurant(name) {
+  selectedRestaurantName = name || "";
+  const select = document.getElementById("restaurant-select");
+  if (select && select.value !== selectedRestaurantName) select.value = selectedRestaurantName;
+
+  const restaurant = (dashboardData?.restaurants || []).find((item) => item.name === selectedRestaurantName);
+  renderRestaurantSpotlight(restaurant);
+
+  document.querySelectorAll("#restaurant-table tbody tr").forEach((row) => {
+    row.classList.toggle("is-selected", row.dataset.restaurant === selectedRestaurantName);
   });
+}
+
+function renderRestaurantSelector(data) {
+  const select = document.getElementById("restaurant-select");
+  if (!select) return;
+
+  const restaurants = restaurantsAlphabetical(data);
+  select.innerHTML = `
+    <option value="">Selecione para ver os números</option>
+    ${restaurants.map((item) => `<option value="${item.name}">${restaurantLabel(item)}</option>`).join("")}
+  `;
+
+  if (selectedRestaurantName && restaurants.some((item) => item.name === selectedRestaurantName)) {
+    select.value = selectedRestaurantName;
+  } else {
+    const first = topRestaurants(data)[0];
+    selectedRestaurantName = first ? first.name : "";
+    select.value = selectedRestaurantName;
+  }
+
+  selectRestaurant(selectedRestaurantName);
+}
+
+function renderRestaurants(data) {
+  const table = document.getElementById("restaurant-table");
+  const restaurants = restaurantsAlphabetical(data);
   const maxScore = Math.max(...restaurants.map(restaurantScore), 1);
 
   table.innerHTML = restaurants.map((item) => {
     const score = Math.round((restaurantScore(item) / maxScore) * 100);
     return `
-      <tr>
+      <tr data-restaurant="${item.name}" tabindex="0" aria-label="Ver detalhes de ${item.name}">
         <td data-label="Restaurante">${item.name}</td>
         <td data-label="Prato consultado"><span class="restaurant-name">${number(item.views)}<small>${item.dish || "Menu participante"}</small></span></td>
         <td data-label="Instagram">${number(item.instagram)}</td>
@@ -287,6 +472,18 @@ function renderRestaurants(data, focus = "views") {
         <td data-label="Índice"><span class="interest-pill">${score}</span></td>
       </tr>`;
   }).join("");
+
+  table.querySelectorAll("tr[data-restaurant]").forEach((row) => {
+    row.addEventListener("click", () => selectRestaurant(row.dataset.restaurant));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectRestaurant(row.dataset.restaurant);
+      }
+    });
+  });
+
+  selectRestaurant(selectedRestaurantName);
 }
 
 function renderEvents(data) {
@@ -303,16 +500,16 @@ function renderEvents(data) {
 }
 
 function renderInsights(data) {
-  const topCity = [...(data.cities || [])].sort((a, b) => b.users - a.users)[0];
-  const topRestaurant = [...(data.restaurants || [])].sort((a, b) => restaurantScore(b) - restaurantScore(a))[0];
+  const cities = [...(data.cities || [])].sort((a, b) => b.users - a.users);
+  const topRestaurant = topRestaurants(data)[0];
   const centroViews = data.centroEuropeu.sectionViews || 0;
   const centroClicks = data.centroEuropeu.clicks || 0;
-  const centroRate = centroViews ? Math.round((centroClicks / centroViews) * 100) : 0;
+  const cityNames = cities.slice(0, 6).map((item) => displayCity(item.city)).join(", ");
 
   const insights = [
-    topCity ? `${topCity.city} é a cidade com maior presença no período, ajudando a entender onde a divulgação está gerando mais alcance.` : "Ainda não há cidades suficientes para leitura.",
-    topRestaurant ? `${topRestaurant.name} aparece com o maior índice de interesse, somando consultas ao prato e cliques de intenção.` : "Ainda não há ranking de restaurantes suficiente.",
-    `O bloco do Centro Europeu teve ${number(centroViews)} visualizações e ${number(centroClicks)} cliques, com taxa estimada de ${centroRate}% de interesse.`,
+    cities.length ? `A ação já despertou interesse em ${number(cities.length)} cidades. Entre as origens aparecem ${cityNames}, mostrando alcance para além do público local.` : "O alcance por cidade começa a aparecer conforme o público acessa o site.",
+    topRestaurant ? `${topRestaurant.name} aparece como destaque de interesse neste momento, combinando consultas ao prato, Instagram e rotas.` : "O destaque de interesse será exibido conforme os menus receberem acessos.",
+    `A marca do Centro Europeu já foi vista ${number(centroViews)} vezes no ambiente do festival, com ${number(centroClicks)} cliques para conhecer mais sobre a instituição.`,
     (data.totals.voteClicks || 0) === 0
       ? "A votação ainda está em fase de espera; a partir de 1º de julho, esse indicador passa a mostrar intenção direta de participação do público."
       : "Os cliques na votação já funcionam como principal indicador de conversão da ação."
@@ -322,43 +519,58 @@ function renderInsights(data) {
 }
 
 function renderMeta(data) {
-  const isDemo = data.source !== "live";
-  setText("source-label", isDemo ? "Prévia do painel · dados demonstrativos" : "Dados reais conectados");
+  const labels = {
+    ga4: "Dados do Google Analytics · GA4",
+    live: "Coleta nova do site · Supabase",
+    demo: "Prévia do painel · dados demonstrativos"
+  };
+  setText("source-label", labels[data.source] || labels.demo);
   setText("updated-at", data.updatedAt ? dateFormatter.format(new Date(data.updatedAt)) : "sem atualização");
 }
 
 function renderDashboard(data) {
-  const focus = document.getElementById("metric-focus");
-
   renderMeta(data);
   renderRealtime(data);
   renderKpis(data);
   renderTimeline(data);
+  setTimelineButtons(timelinePeriod);
   renderCities(data);
-  renderRestaurants(data, focus.value);
+  renderRestaurantSelector(data);
+  renderRestaurants(data);
   renderEvents(data);
   renderInsights(data);
 }
 
 async function refreshDashboard() {
-  const period = document.getElementById("period-filter").value;
-  dashboardData = await loadData(period);
+  dashboardData = await loadData(MAIN_PERIOD);
   renderDashboard(dashboardData);
+  if (timelinePeriod !== MAIN_PERIOD) {
+    refreshTimeline(timelinePeriod);
+  }
+}
+
+async function refreshTimeline(period) {
+  timelinePeriod = period;
+  setTimelineButtons(period);
+  const timelineData = period === MAIN_PERIOD && dashboardData ? dashboardData : await loadData(period);
+  renderTimeline(timelineData);
 }
 
 async function init() {
-  const focus = document.getElementById("metric-focus");
-  const period = document.getElementById("period-filter");
+  const restaurantSelect = document.getElementById("restaurant-select");
 
   await refreshDashboard();
 
-  focus.addEventListener("change", () => renderRestaurants(dashboardData, focus.value));
-  period.addEventListener("change", refreshDashboard);
+  restaurantSelect.addEventListener("change", () => selectRestaurant(restaurantSelect.value));
+
+  document.querySelectorAll("#timeline-controls [data-period]").forEach((button) => {
+    button.addEventListener("click", () => refreshTimeline(button.dataset.period));
+  });
 
   refreshTimer = window.setInterval(() => {
-    if (document.hidden || dashboardData?.source !== "live") return;
+    if (document.hidden) return;
     refreshDashboard();
-  }, 60000);
+  }, 300000);
 }
 
 init();
