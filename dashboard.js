@@ -86,8 +86,44 @@ const dateFormatter = new Intl.DateTimeFormat("pt-BR", {
 
 let cityMap;
 let cityLayer;
+let dashboardData;
+let refreshTimer;
 
-async function loadData() {
+function supabaseConfig() {
+  const config = window.SABORES_SUPABASE || {};
+  const url = String(config.url || "").replace(/\/$/, "");
+  const anonKey = String(config.anonKey || "");
+  if (!url || !anonKey) return null;
+  return { url, anonKey };
+}
+
+async function loadLiveData(period = "7d") {
+  const config = supabaseConfig();
+  if (!config) return null;
+
+  const response = await fetch(`${config.url}/rest/v1/rpc/get_dashboard_data`, {
+    method: "POST",
+    headers: {
+      apikey: config.anonKey,
+      Authorization: `Bearer ${config.anonKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ period_key: period }),
+    cache: "no-store"
+  });
+
+  if (!response.ok) throw new Error("Supabase indisponível");
+  return await response.json();
+}
+
+async function loadData(period = "7d") {
+  try {
+    const liveData = await loadLiveData(period);
+    if (liveData) return liveData;
+  } catch (error) {
+    console.warn("Usando prévia do painel:", error);
+  }
+
   try {
     const response = await fetch("dashboard-data.json", { cache: "no-store" });
     if (!response.ok) throw new Error("Sem arquivo de dados");
@@ -291,8 +327,7 @@ function renderMeta(data) {
   setText("updated-at", data.updatedAt ? dateFormatter.format(new Date(data.updatedAt)) : "sem atualização");
 }
 
-async function init() {
-  const data = await loadData();
+function renderDashboard(data) {
   const focus = document.getElementById("metric-focus");
 
   renderMeta(data);
@@ -303,8 +338,27 @@ async function init() {
   renderRestaurants(data, focus.value);
   renderEvents(data);
   renderInsights(data);
+}
 
-  focus.addEventListener("change", () => renderRestaurants(data, focus.value));
+async function refreshDashboard() {
+  const period = document.getElementById("period-filter").value;
+  dashboardData = await loadData(period);
+  renderDashboard(dashboardData);
+}
+
+async function init() {
+  const focus = document.getElementById("metric-focus");
+  const period = document.getElementById("period-filter");
+
+  await refreshDashboard();
+
+  focus.addEventListener("change", () => renderRestaurants(dashboardData, focus.value));
+  period.addEventListener("change", refreshDashboard);
+
+  refreshTimer = window.setInterval(() => {
+    if (document.hidden || dashboardData?.source !== "live") return;
+    refreshDashboard();
+  }, 60000);
 }
 
 init();
